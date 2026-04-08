@@ -4,340 +4,293 @@
 #include <Preferences.h>
 #include <ArduinoOTA.h>
 
-// ===== LOG =====
+// =========================
+// LOG
+// =========================
+#define LOG(msg) Serial.println(msg)
+#define LOGF(...) Serial.printf(__VA_ARGS__)
 
-#define LOGI(fmt, ...) Serial.printf("[INFO ] " fmt "\n", ##__VA_ARGS__)
-#define LOGW(fmt, ...) Serial.printf("[WARN ] " fmt "\n", ##__VA_ARGS__)
+// =========================
+// VARIÁVEIS
+// =========================
+bool novaMensagem = false;
 
-// ===== PINOS =====
-
-const int BTN[3] = {26,33,16};
-const int RELAY[3] = {19,18,17};
-
-const int LED_R=14;
-const int LED_G=12;
-const int LED_B=27;
-
-// ===== MQTT =====
-
-const char* MQTT_SERVER="192.168.0.107";
-const int MQTT_PORT=1883;
-
-const char* TOPIC_SET[3]={
-"casa/lampada1/set",
-"casa/lampada2/set",
-"casa/lampada3/set"
-};
-
-const char* TOPIC_STATUS[3]={
-"casa/lampada1/status",
-"casa/lampada2/status",
-"casa/lampada3/status"
-};
-
-// ===== OBJETOS =====
-
-WiFiClient wifiClient;
-PubSubClient mqtt(wifiClient);
+WiFiClient espClient;
+PubSubClient client(espClient);
 Preferences prefs;
 
-QueueHandle_t mqttQueue;
+// Botões
+const int botoes[3] = { 26, 33, 16 };
 
-// ===== ESTADOS =====
+// Relés
+const int saidas[3] = { 19, 18, 17 };
 
-bool lampState[3]={false,false,false};
-int btnLast[3]={HIGH,HIGH,HIGH};
+// LED RGB
+const int LED_R = 14;
+const int LED_G = 12;
+const int LED_B = 27;
 
-volatile bool mqttMsg=false;
+bool estadoLamps[3] = { false, false, false };
+int estadoAnterior[3] = { HIGH, HIGH, HIGH };
+unsigned long lastDebounce[3] = { 0 };
 
-// ===== STRUCT =====
+// MQTT
+const int mqtt_port = 1883;
+const char* mqtt_server = "raspberrypi.local";
 
-struct MQTTMsg
-{
-uint8_t lamp;
-bool state;
+const char* topicos_set[3] = {
+  "casa/lampada1/set",
+  "casa/lampada2/set",
+  "casa/lampada3/set"
 };
 
-// ===== LED =====
+const char* topicos_status[3] = {
+  "casa/lampada1/status",
+  "casa/lampada2/status",
+  "casa/lampada3/status"
+};
 
-void setRGB(bool r,bool g,bool b)
-{
-digitalWrite(LED_R,r);
-digitalWrite(LED_G,g);
-digitalWrite(LED_B,b);
+// =========================
+// LED RGB
+// =========================
+void setRGB(bool r, bool g, bool b) {
+  digitalWrite(LED_R, r);
+  digitalWrite(LED_G, g);
+  digitalWrite(LED_B, b);
 }
 
-// ===== NVS =====
-
-void saveState(int i)
-{
-char key[8];
-sprintf(key,"lamp%d",i);
-prefs.putBool(key,lampState[i]);
+// =========================
+// EEPROM
+// =========================
+void salvarEstado(int i) {
+  prefs.putBool(("lamp" + String(i)).c_str(), estadoLamps[i]);
+  LOGF("[EEPROM] Lamp %d salva = %s\n", i + 1, estadoLamps[i] ? "ON" : "OFF");
 }
 
-void loadState()
-{
-for(int i=0;i<3;i++)
-{
-char key[8];
-sprintf(key,"lamp%d",i);
+void carregarEstados() {
+  for (int i = 0; i < 3; i++) {
+    estadoLamps[i] = prefs.getBool(("lamp" + String(i)).c_str(), false);
+    digitalWrite(saidas[i], estadoLamps[i] ? HIGH : LOW);
 
-lampState[i]=prefs.getBool(key,false);
-
-digitalWrite(RELAY[i],lampState[i]);
-}
+    LOGF("[BOOT] Lamp %d = %s\n", i + 1, estadoLamps[i] ? "ON" : "OFF");
+  }
 }
 
-// ===== MQTT =====
+// =========================
+// MQTT CALLBACK
+// =========================
+void callback(char* topic, byte* payload, unsigned int length) {
+  novaMensagem = true;
 
-void publishStatus(int i)
-{
-mqtt.publish(
-TOPIC_STATUS[i],
-lampState[i]?"ON":"OFF",
-true);
+  String msg;
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+
+  LOGF("[MQTT] %s -> %s\n", topic, msg.c_str());
+
+  for (int i = 0; i < 3; i++) {
+    if (String(topic) == topicos_set[i]) {
+      estadoLamps[i] = (msg == "ON");
+
+      digitalWrite(saidas[i], estadoLamps[i]);
+
+      if (client.connected()) {
+        client.publish(topicos_status[i],
+                       estadoLamps[i] ? "ON" : "OFF", true);
+      }
+
+      salvarEstado(i);
+    }
+  }
 }
 
-void mqttCallback(char* topic, byte* payload, unsigned int length)
-{
-char msg[32];
+// =========================
+// MQTT RECONNECT
+// =========================
+void reconnectTask(void* parameter) {
+  String clientId = "ESP32_" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
-if(length>=sizeof(msg))
-length=sizeof(msg)-1;
+  while (true) {
+    if (!client.connected()) {
 
-memcpy(msg,payload,length);
-msg[length]='\0';
+      LOG("[MQTT] Tentando conectar...");
 
-LOGI("MQTT RX %s -> %s",topic,msg);
+      if (client.connect(clientId.c_str())) {
 
-for(int i=0;i<3;i++)
-{
-if(strcmp(topic,TOPIC_SET[i])==0)
-{
-MQTTMsg m;
+        LOG("[MQTT] Conectado!");
 
-m.lamp=i;
-m.state=(strcmp(msg,"ON")==0);
+        client.publish("casa/status", "ONLINE", true);
 
-xQueueSend(mqttQueue,&m,0);
+        for (int i = 0; i < 3; i++) {
+          client.subscribe(topicos_set[i]);
 
-mqttMsg=true;
-}
-}
-}
+          LOGF("[MQTT] Subscrito: %s\n", topicos_set[i]);
 
-// ===== TASK PROCESS MQTT =====
+          client.publish(topicos_status[i],
+                         estadoLamps[i] ? "ON" : "OFF", true);
+        }
+      } else {
+        LOGF("[MQTT] Falhou rc=%d\n", client.state());
+      }
+    }
 
-void taskMQTTProcess(void *pv)
-{
-MQTTMsg msg;
-
-for(;;)
-{
-if(xQueueReceive(mqttQueue,&msg,portMAX_DELAY))
-{
-lampState[msg.lamp]=msg.state;
-
-digitalWrite(RELAY[msg.lamp],lampState[msg.lamp]);
-
-publishStatus(msg.lamp);
-
-saveState(msg.lamp);
-}
-}
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+  }
 }
 
-// ===== TASK BOTÕES =====
+// =========================
+// BOTÕES
+// =========================
+const unsigned long debounceDelay = 80;
 
-void taskButtons(void *pv)
-{
-for(;;)
-{
-for(int i=0;i<3;i++)
-{
-int r=digitalRead(BTN[i]);
+void taskBotoes(void *parameter) {
+  Serial.printf("Task rodando: %s\n", pcTaskGetName(NULL));
 
-if(r!=btnLast[i])
-{
-vTaskDelay(pdMS_TO_TICKS(40));
+  while (true) {
+    for (int i = 0; i < 3; i++) {
 
-if(digitalRead(BTN[i])==LOW)
-{
-lampState[i]=!lampState[i];
+      int leitura = digitalRead(botoes[i]);
 
-digitalWrite(RELAY[i],lampState[i]);
+      if (leitura != estadoAnterior[i]) {
 
-publishStatus(i);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
 
-saveState(i);
+        leitura = digitalRead(botoes[i]);
+
+        if (leitura != estadoAnterior[i]) {
+
+          estadoAnterior[i] = leitura;
+
+          // 🔁 Alterna em QUALQUER mudança
+          estadoLamps[i] = !estadoLamps[i];
+
+          digitalWrite(saidas[i], estadoLamps[i]);
+
+          LOGF("[BOTAO] Lamp %d -> %s\n",
+               i + 1, estadoLamps[i] ? "ON" : "OFF");
+
+          if (client.connected()) {
+            client.publish(topicos_status[i],
+                           estadoLamps[i] ? "ON" : "OFF", true);
+          }
+
+          salvarEstado(i);
+        }
+      }
+    }
+
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+// =========================
+// MQTT LOOP
+// =========================
+void taskMQTTLoop(void* parameter) {
+  while (true) {
+    if (client.connected()) {
+      client.loop();
+    }
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
 }
 
-btnLast[i]=r;
-}
-}
-
-vTaskDelay(pdMS_TO_TICKS(50));
-}
-}
-
-// ===== TASK MQTT LOOP =====
-
-void taskMQTT(void *pv)
-{
-for(;;)
-{
-if(mqtt.connected())
-mqtt.loop();
-
-vTaskDelay(pdMS_TO_TICKS(10));
-}
+// =========================
+// OTA TASK
+// =========================
+void taskOTA(void* parameter) {
+  while (true) {
+    ArduinoOTA.handle();
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
 }
 
-// ===== TASK RECONNECT =====
+// =========================
+// LED STATUS
+// =========================
+void taskStatusLED(void* parameter) {
+  while (true) {
 
-void taskReconnect(void *pv)
-{
-for(;;)
-{
-if(WiFi.status()!=WL_CONNECTED)
-{
-WiFi.reconnect();
+    if (novaMensagem) {
+      setRGB(1, 0, 1);  // roxo
+      vTaskDelay(200 / portTICK_PERIOD_MS);
+      novaMensagem = false;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+      setRGB(1, 0, 0);  // vermelho
+    } else if (!client.connected()) {
+      setRGB(0, 0, 1);  // azul
+    } else {
+      setRGB(0, 1, 0);  // verde
+    }
+
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+  }
 }
 
-if(!mqtt.connected())
-{
-LOGW("MQTT reconnect");
+// =========================
+// SETUP
+// =========================
+void setup() {
+  Serial.begin(115200);
 
-String id="ESP32-"+WiFi.macAddress();
+  prefs.begin("lampadas", false);
 
-if(mqtt.connect(id.c_str()))
-{
-for(int i=0;i<3;i++)
-{
-mqtt.subscribe(TOPIC_SET[i]);
-publishStatus(i);
+  for (int i = 0; i < 3; i++) {
+    pinMode(botoes[i], INPUT_PULLUP);
+    pinMode(saidas[i], OUTPUT);
+    digitalWrite(saidas[i], LOW);
+    estadoAnterior[i] = digitalRead(botoes[i]);
+  }
+
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
+
+  WiFiManager wm;
+  wm.setTimeout(180);
+
+  if (!wm.autoConnect("Configura-Lampadas")) {
+    ESP.restart();
+  }
+
+  LOG("========== WIFI ==========");
+  LOGF("IP: %s\n", WiFi.localIP().toString().c_str());
+  LOGF("SSID: %s\n", WiFi.SSID().c_str());
+  LOG("==========================");
+
+  carregarEstados();
+
+  // MQTT
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+
+  // OTA
+  ArduinoOTA.setHostname("ESP32-Lampadas");
+
+  ArduinoOTA.onStart([]() {
+    LOG("[OTA] Iniciando...");
+  });
+
+  ArduinoOTA.onEnd([]() {
+    LOG("[OTA] Finalizado!");
+  });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+    LOGF("[OTA] %u%%\n", (progress / (total / 100)));
+  });
+
+  ArduinoOTA.begin();
+
+  // TASKS
+  xTaskCreatePinnedToCore(taskMQTTLoop, "MQTT", 4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(reconnectTask, "Reconnect", 4096, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskBotoes, "Botoes", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskStatusLED, "LED", 2048, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(taskOTA, "OTA", 4096, NULL, 1, NULL, 1);
 }
 
-LOGI("MQTT conectado");
-}
-}
-
-vTaskDelay(pdMS_TO_TICKS(5000));
-}
-}
-
-// ===== STATUS =====
-
-void taskStatus(void *pv)
-{
-unsigned long last=0;
-
-for(;;)
-{
-if(mqttMsg)
-{
-setRGB(1,0,1);
-vTaskDelay(pdMS_TO_TICKS(200));
-mqttMsg=false;
-}
-
-if(WiFi.status()!=WL_CONNECTED)
-setRGB(1,0,0);
-
-else if(!mqtt.connected())
-setRGB(0,0,1);
-
-else
-setRGB(0,1,0);
-
-if(millis()-last>10000)
-{
-LOGI("----- STATUS -----");
-LOGI("RSSI %d",WiFi.RSSI());
-LOGI("MQTT %s",mqtt.connected()?"OK":"OFF");
-LOGI("Heap livre %u",ESP.getFreeHeap());
-last=millis();
-}
-
-vTaskDelay(pdMS_TO_TICKS(400));
-}
-}
-
-// ===== OTA =====
-
-void setupOTA()
-{
-ArduinoOTA.setHostname("esp-lampadas");
-ArduinoOTA.setPassword("12345678");
-
-ArduinoOTA.onStart([](){
-LOGI("OTA start");
-});
-
-ArduinoOTA.onEnd([](){
-LOGI("OTA end");
-});
-
-ArduinoOTA.begin();
-}
-void configModeCallback (WiFiManager *myWiFiManager)
-{
-  Serial.println("Modo configuracao WiFi");
-
-  // LED amarelo (vermelho + verde)
-  digitalWrite(LED_R, HIGH);
-  digitalWrite(LED_G, HIGH);
-  digitalWrite(LED_B, LOW);
-}
-
-// ===== SETUP =====
-
-void setup()
-{
-Serial.begin(115200);
-
-prefs.begin("lampadas",false);
-
-for(int i=0;i<3;i++)
-{
-pinMode(BTN[i],INPUT_PULLUP);
-pinMode(RELAY[i],OUTPUT);
-}
-
-pinMode(LED_R,OUTPUT);
-pinMode(LED_G,OUTPUT);
-pinMode(LED_B,OUTPUT);
-
-mqttQueue=xQueueCreate(10,sizeof(MQTTMsg));
-
-WiFiManager wm;
-wm.setAPCallback(configModeCallback);
-if(!wm.autoConnect("Configura-Lampadas")){
-ESP.restart();
-}
-setupOTA();
-
-mqtt.setServer(MQTT_SERVER,MQTT_PORT);
-mqtt.setCallback(mqttCallback);
-mqtt.setBufferSize(512);
-mqtt.setSocketTimeout(5);
-
-loadState();
-
-xTaskCreatePinnedToCore(taskButtons,"BTN",4096,NULL,1,NULL,1);
-xTaskCreatePinnedToCore(taskMQTTProcess,"MQTTProc",4096,NULL,1,NULL,1);
-xTaskCreatePinnedToCore(taskMQTT,"MQTTLoop",4096,NULL,1,NULL,0);
-xTaskCreatePinnedToCore(taskReconnect,"MQTTRec",4096,NULL,1,NULL,0);
-xTaskCreatePinnedToCore(taskStatus,"Status",4096,NULL,1,NULL,1);
-
-LOGI("Sistema iniciado");
-}
-
-// ===== LOOP =====
-
-void loop()
-{
-ArduinoOTA.handle();
-delay(1);
+void loop() {
+  // FreeRTOS
 }
